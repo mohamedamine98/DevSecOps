@@ -1,0 +1,251 @@
+stages:
+  - sast
+  - test
+  - code_quality
+  - build
+  - build_docker
+  - apk_test
+  - IOS_test
+  - container_testing
+  - dynamic_test
+  - deploy
+include:
+  - template: Security/SAST.gitlab-ci.yml
+  #- template: Dependency-Scanning.gitlab-ci.yml
+  #- template: License-Scanning.gitlab-ci.yml
+  #- template: Code-Quality.gitlab-ci.yml
+ # - template: Security/Container-Scanning.gitlab-ci.yml
+
+cache:
+  paths:
+    - $CI_PROJECT_DIR/.pub-cache/
+  policy: push
+
+variables:
+  SAST_EXPERIMENTAL_FEATURES: "true"
+  SAST_DEFAULT_ANALYZERS: "mobsf"
+  SECURE_LOG_LEVEL: "debug"
+  FLAVOR: "production"
+
+mobsf-android-sast:
+  stage: apk_test
+  needs:
+    - flutter_build_android
+  artifacts:
+    paths:
+      - mobsf-android-sast.json
+
+.mobsf-ios-sast:
+  stage: IOS_test
+  needs:
+    - flutter_build_ios
+  artifacts:
+    paths:
+      - mobsf-ios-sast.json
+
+#sast:
+ # stage: sast
+  #script:
+   # - echo 'Static Application Security Testing (SAST) - check your source code for known vulnerabilities.'
+  #timeout: 10m
+  #allow_failure: true
+  #artifacts:
+   # paths:
+    #  - sast_rapport
+
+.spotbugs-sast:
+  variables:
+    COMPILE: "false"
+  artifacts:
+    reports:
+      sast: gl-sast-report.json
+
+code_quality:
+  stage: code_quality
+  image: "cirrusci/flutter:latest"
+  cache:
+     key: "$CI_COMMIT_REF_NAME" 
+     paths:
+      - $CI_PROJECT_DIR/.pub-cache/
+     policy: pull
+  before_script:
+    - flutter pub global activate dart_code_metrics
+    - export PATH="${PATH}:${HOME}/.pub-cache/bin"
+  script:
+    - metrics lib -r codeclimate  > gl-code-quality-report.json
+  allow_failure: true
+  artifacts:
+    reports:
+      codequality: gl-code-quality-report.json
+
+
+junitreport:
+  stage: test
+  image: "cirrusci/flutter:latest"
+  cache:
+     key: "$CI_COMMIT_REF_NAME" 
+     paths:
+      - $CI_PROJECT_DIR/.pub-cache/
+     policy: pull
+  before_script:
+    - flutter pub global activate junitreport
+    - export PATH="{$PATH}:${HOME}/.pub-cache/bin" 
+  script:
+    - flutter test --machine --coverage | tojunit -o report.xml
+    - lcov --summary coverage/lcov.info
+    - genhtml coverage/lcov.info --output=coverage
+  coverage: '/lines\.*: \d+\.\d+\%/'
+  allow_failure: true
+  artifacts:
+    name: coverage
+    paths:
+      - $CI_PROJECT_DIR/coverage
+
+flutter_build_android: 
+  stage: build 
+  image: "cirrusci/flutter:latest"
+  cache:
+     key: "$CI_COMMIT_REF_NAME" 
+     paths:
+      - $CI_PROJECT_DIR/.pub-cache/
+     policy: pull   
+  before_script:
+    - flutter clean
+    - flutter packages get
+    - flutter doctor --android-licenses
+  script:
+     - flutter build apk
+  artifacts:
+    paths:
+      - build/app/outputs/apk/release/app-release.apk
+
+
+flutter_build_web:
+  image: "cirrusci/flutter:latest" 
+  stage: build 
+  cache:
+     key: "$CI_COMMIT_REF_NAME" 
+     paths:
+      - $CI_PROJECT_DIR/.pub-cache/
+     policy: pull
+  before_script:
+    - flutter clean
+    - flutter packages get
+  script:
+     - flutter build web
+  artifacts:
+    paths:
+      - build/web
+  allow_failure: true
+
+
+
+
+.flutter_build_ios:
+  stage: build
+  image: "cirrusci/flutter:latest"
+  cache:
+     key: "$CI_COMMIT_REF_NAME" 
+     paths:
+      - $CI_PROJECT_DIR/.pub-cache/
+     policy: pull
+  before_script:
+    - flutter clean
+    - flutter packages get
+  script:
+    - flutter build ios --flavor ${FLAVOR}
+    - cd ios
+    - xcodebuild clean archive -workspace Runner.xcworkspace -scheme Runner -archivePath RunnerArchive
+    - xcodebuild -exportArchive -archivePath RunnerArchive.xcarchive -exportOptionsPlist ExportOptions.plist -exportPath ./build
+  artifacts:
+    paths:
+      - ios/build/Runner.ipa
+
+
+build-docker:
+  stage: build_docker
+  only:
+    - main
+  image: docker:20.10.16
+  needs:
+    - flutter_build_web
+  services:
+    - name: docker:20.10.16-dind
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+  allow_failure: true
+  before_script:
+    - apk update
+    - apk add yq
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+    - export JSON_VERSION=$(yq eval .version pubspec.yaml )
+    - export VERSION=$JSON_VERSION.$CI_PIPELINE_IID
+    
+  script:
+    - docker build -t $CI_REGISTRY_IMAGE:$VERSION  .
+    - docker push $CI_REGISTRY_IMAGE:$VERSION
+
+trivy:
+  stage: container_testing
+  image:
+    name: docker.io/aquasec/trivy:latest
+    entrypoint: [""]
+  variables:
+    GIT_STRATEGY: none
+    TRIVY_USERNAME: "$CI_REGISTRY_USER"
+    TRIVY_PASSWORD: "$CI_REGISTRY_PASSWORD"
+    TRIVY_AUTH_URL: "$CI_REGISTRY"
+    FULL_IMAGE_NAME: $CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG
+  script:
+    - trivy --version
+    - time trivy image --clear-cache
+  
+    - time trivy --download-db-only --no-progress --cache-dir .trivycache/
+    - time trivy --exit-code 0 --cache-dir .trivycache/ --no-progress --format template --template "@/contrib/gitlab.tpl"
+        --output "$CI_PROJECT_DIR/gl-container-scanning-report.json" "$FULL_IMAGE_NAME"
+    - time trivy --exit-code 0 --cache-dir .trivycache/ --no-progress "$FULL_IMAGE_NAME"
+    - time trivy --exit-code 1 --cache-dir .trivycache/ --severity CRITICAL --no-progress "$FULL_IMAGE_NAME"
+  cache:
+    paths:
+      - .trivycache/
+  artifacts:
+    when: always
+    reports:
+      container_scanning: gl-container-scanning-report.json
+
+
+zap_scan:
+  stage: dynamic_test
+  allow_failure: true
+  image: owasp/zap2docker-stable:latest
+  dependencies:
+  - build-docker
+  variables:
+    dynamic_test_WEBSITE: http://192.168.56.1:500
+  script:
+    - mkdir /zap/wrk
+    - cd /zap/wrk/
+    - zap-full-scan.py -t $dynamic_test_WEBSITE -r zap_report.html
+    - ls /zap/wrk
+    - pwd
+    - cp zap_report.html wrk/zap_report.html 
+       #- perl ./smoke_test/defectdojo_submit.pl
+  artifacts:
+    paths:
+      - zap_report  
+
+
+.container_scanning:
+  variables:
+    CS_ANALYZER_IMAGE: registry.gitlab.com/security-products/container-scanning/grype:4
+  script:
+    - echo container-scanning starting ...
+
+
+.deploy_android:
+  stage: deploy
+  image: "cirrusci/flutter:latest"
+  dependencies:
+    - flutter_build_android
+  script:
+    - echo deploy_android
